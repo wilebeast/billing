@@ -1,0 +1,171 @@
+package factor
+
+import (
+	"context"
+	"testing"
+)
+
+func strptr(s string) *string { return &s }
+
+func TestResolveMVPFactors(t *testing.T) {
+	engine, err := NewEngine([]FactorDefinition{
+		{
+			Code:     "payment_amount",
+			Type:     FactorTypeEventField,
+			DataType: FactorDataTypeDecimal,
+			Required: true,
+			EventField: &EventFieldConfig{
+				SourcePath: "$.payment.amount",
+			},
+		},
+		{
+			Code:         "discount_amount",
+			Type:         FactorTypeEventField,
+			DataType:     FactorDataTypeDecimal,
+			Required:     false,
+			DefaultValue: strptr("0"),
+			EventField: &EventFieldConfig{
+				SourcePath: "$.payment.discount_amount",
+			},
+		},
+		{
+			Code:     "merchant_id",
+			Type:     FactorTypeEventField,
+			DataType: FactorDataTypeString,
+			Required: true,
+			EventField: &EventFieldConfig{
+				SourcePath: "$.merchant.id",
+			},
+		},
+		{
+			Code:     "base_amount",
+			Type:     FactorTypeExpression,
+			DataType: FactorDataTypeDecimal,
+			Expression: &ExpressionConfig{
+				Expression:    "payment_amount - discount_amount",
+				DependFactors: []string{"payment_amount", "discount_amount"},
+			},
+		},
+		{
+			Code:     "merchant_level",
+			Type:     FactorTypeRPC,
+			DataType: FactorDataTypeString,
+			RPC: &RPCConfig{
+				ProviderCode: "GET_MERCHANT_LEVEL",
+				Method:       "MerchantService.GetMerchantLevel",
+				InputMapping: map[string]string{
+					"merchant_id": "merchant_id",
+				},
+				OutputPath: "$.data.level",
+			},
+		},
+		{
+			Code:     "service_fee_rate",
+			Type:     FactorTypeTable,
+			DataType: FactorDataTypeDecimal,
+			Table: &TableLookupConfig{
+				TableCode: "service_fee_rate",
+				LookupKey: map[string]string{
+					"merchant_level": "merchant_level",
+				},
+				OutputPath: "$.rate",
+			},
+		},
+		{
+			Code:     "service_fee_amount",
+			Type:     FactorTypeExpression,
+			DataType: FactorDataTypeDecimal,
+			Expression: &ExpressionConfig{
+				Expression:    "base_amount * service_fee_rate",
+				DependFactors: []string{"base_amount", "service_fee_rate"},
+			},
+		},
+	}, makeRPCProvider(), makeTableProvider())
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+
+	event := map[string]any{
+		"payment": map[string]any{
+			"amount": 100.0,
+		},
+		"merchant": map[string]any{
+			"id": "m_001",
+		},
+	}
+
+	ctx, err := engine.Resolve(context.Background(), event, []string{"service_fee_amount"})
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+
+	if got := ctx.Factors["discount_amount"].Status; got != FactorStatusDefaulted {
+		t.Fatalf("discount_amount status = %s, want %s", got, FactorStatusDefaulted)
+	}
+
+	if got := ctx.Factors["merchant_level"].Value.(string); got != "NORMAL" {
+		t.Fatalf("merchant_level = %s", got)
+	}
+
+	if got := ctx.Factors["service_fee_amount"].Value.(float64); got != 20 {
+		t.Fatalf("service_fee_amount = %v, want 20", got)
+	}
+}
+
+func TestGetByPathListIndex(t *testing.T) {
+	event := map[string]any{
+		"items": []any{
+			map[string]any{
+				"sku":    "sku_001",
+				"amount": 10.0,
+			},
+			map[string]any{
+				"sku":    "sku_002",
+				"amount": 20.0,
+			},
+		},
+	}
+
+	value, ok, err := getByPath(event, "$.items.1.amount")
+	if err != nil {
+		t.Fatalf("getByPath returned error: %v", err)
+	}
+	if !ok {
+		t.Fatalf("getByPath did not find list element")
+	}
+
+	got, ok := value.(float64)
+	if !ok {
+		t.Fatalf("value type = %T, want float64", value)
+	}
+	if got != 20.0 {
+		t.Fatalf("value = %v, want 20", got)
+	}
+}
+
+func makeRPCProvider() *InMemoryRPCProvider {
+	provider := NewInMemoryRPCProvider()
+	provider.Register("GET_MERCHANT_LEVEL", func(_ context.Context, method string, input map[string]any) (any, error) {
+		if method != "MerchantService.GetMerchantLevel" {
+			return nil, nil
+		}
+		merchantID := input["merchant_id"].(string)
+		level := "NORMAL"
+		if merchantID == "m_vip" {
+			level = "VIP"
+		}
+		return map[string]any{
+			"data": map[string]any{
+				"level": level,
+			},
+		}, nil
+	})
+	return provider
+}
+
+func makeTableProvider() *InMemoryTableProvider {
+	table := NewInMemoryTableProvider()
+	table.Put("service_fee_rate", map[string]any{"merchant_level": "NORMAL"}, map[string]any{"rate": 0.2})
+	table.Put("service_fee_rate", map[string]any{"merchant_level": "VIP"}, map[string]any{"rate": 0.15})
+	return table
+}
