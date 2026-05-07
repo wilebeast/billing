@@ -8,14 +8,26 @@ import (
 
 type Engine struct {
 	definitions map[string]FactorDefinition
+	resolvers   map[FactorType]FactorResolver
 	rpcProvider RPCProvider
 	table       TableProvider
 }
 
 func NewEngine(definitions []FactorDefinition, rpcProvider RPCProvider, table TableProvider) (*Engine, error) {
+	resolvers := map[FactorType]FactorResolver{
+		FactorTypeEventField: EventFieldResolver{},
+		FactorTypeExpression: ExpressionResolver{},
+		FactorTypeRPC:        RPCResolver{},
+		FactorTypeTable:      TableLookupResolver{},
+	}
 	defs := make(map[string]FactorDefinition, len(definitions))
+	catalog := FactorCatalog(defs)
 	for _, def := range definitions {
-		if err := def.ValidateMVP(); err != nil {
+		resolver, ok := resolvers[def.Type]
+		if !ok {
+			return nil, fmt.Errorf("factor %s: unsupported factor type %s", def.Code, def.Type)
+		}
+		if err := resolver.Validate(def, catalog); err != nil {
 			return nil, err
 		}
 		defs[def.Code] = def
@@ -23,6 +35,7 @@ func NewEngine(definitions []FactorDefinition, rpcProvider RPCProvider, table Ta
 
 	return &Engine{
 		definitions: defs,
+		resolvers:   resolvers,
 		rpcProvider: rpcProvider,
 		table:       table,
 	}, nil
@@ -63,7 +76,22 @@ func (e *Engine) resolveOne(
 	visiting[code] = true
 	defer delete(visiting, code)
 
-	value, err := e.resolveByType(ctx, event, def, resolved, visiting)
+	resolver, ok := e.resolvers[def.Type]
+	if !ok {
+		return FactorValue{}, fmt.Errorf("factor %s type %s not supported", def.Code, def.Type)
+	}
+
+	value, err := resolver.Resolve(ctx, ResolveRequest{
+		Factor:  def,
+		Catalog: FactorCatalog(e.definitions),
+		Event:   event,
+		Values:  resolved,
+		ResolveDependency: func(ctx context.Context, dependency string) (FactorValue, error) {
+			return e.resolveOne(ctx, event, dependency, resolved, visiting)
+		},
+		RPCProvider:   e.rpcProvider,
+		TableProvider: e.table,
+	})
 	if err != nil {
 		if def.DefaultValue != nil {
 			defaulted, defaultErr := buildFactorValue(def, FactorStatusDefaulted, *def.DefaultValue)
@@ -79,113 +107,24 @@ func (e *Engine) resolveOne(
 	return value, nil
 }
 
-func (e *Engine) resolveByType(
+func resolveMappedInputs(
 	ctx context.Context,
-	event map[string]any,
-	def FactorDefinition,
-	resolved map[string]FactorValue,
-	visiting map[string]bool,
-) (FactorValue, error) {
-	switch def.Type {
-	case FactorTypeEventField:
-		raw, ok, err := getByPath(event, def.EventField.SourcePath)
-		if err != nil {
-			return FactorValue{}, err
-		}
-		if !ok {
-			return FactorValue{}, fmt.Errorf("factor %s path %s missing", def.Code, def.EventField.SourcePath)
-		}
-		if raw == nil {
-			return FactorValue{
-				FactorCode: def.Code,
-				FactorType: def.Type,
-				DataType:   def.DataType,
-				Status:     FactorStatusNull,
-				Value:      nil,
-				ValueText:  "null",
-			}, nil
-		}
-		return buildFactorValue(def, FactorStatusOK, raw)
-	case FactorTypeExpression:
-		params := map[string]any{}
-		deps := def.Expression.DependFactors
-		if len(deps) == 0 {
-			var err error
-			deps, err = expressionVariables(def.Expression.Expression)
-			if err != nil {
-				return FactorValue{}, err
-			}
-		}
-		for _, dep := range deps {
-			value, err := e.resolveOne(ctx, event, dep, resolved, visiting)
-			if err != nil {
-				return FactorValue{}, err
-			}
-			if !isScalarStatusOK(value) {
-				return FactorValue{}, fmt.Errorf("expression factor %s depends on unusable factor %s status=%s", def.Code, dep, value.Status)
-			}
-			params[dep] = value.Value
-		}
-		raw, err := evaluateExpression(def.Expression.Expression, params)
-		if err != nil {
-			return FactorValue{}, err
-		}
-		return buildFactorValue(def, FactorStatusOK, raw)
-	case FactorTypeRPC:
-		input, err := e.resolveMappedInputs(ctx, event, def.RPC.InputMapping, resolved, visiting)
-		if err != nil {
-			return FactorValue{}, err
-		}
-		raw, err := e.rpcProvider.Call(ctx, def.RPC.ProviderCode, def.RPC.Method, input)
-		if err != nil {
-			return FactorValue{}, err
-		}
-		if def.RPC.OutputPath != "" {
-			raw, _, err = getByPath(raw, def.RPC.OutputPath)
-			if err != nil {
-				return FactorValue{}, err
-			}
-		}
-		return buildFactorValue(def, FactorStatusOK, raw)
-	case FactorTypeTable:
-		key, err := e.resolveMappedInputs(ctx, event, def.Table.LookupKey, resolved, visiting)
-		if err != nil {
-			return FactorValue{}, err
-		}
-		raw, err := e.table.Lookup(ctx, def.Table.TableCode, key)
-		if err != nil {
-			return FactorValue{}, err
-		}
-		if def.Table.OutputPath != "" {
-			raw, _, err = getByPath(raw, def.Table.OutputPath)
-			if err != nil {
-				return FactorValue{}, err
-			}
-		}
-		return buildFactorValue(def, FactorStatusOK, raw)
-	default:
-		return FactorValue{}, fmt.Errorf("factor %s type %s not supported", def.Code, def.Type)
-	}
-}
-
-func (e *Engine) resolveMappedInputs(
-	ctx context.Context,
+	catalog FactorCatalog,
 	event map[string]any,
 	mapping map[string]string,
-	resolved map[string]FactorValue,
-	visiting map[string]bool,
+	resolveDependency func(ctx context.Context, code string) (FactorValue, error),
 ) (map[string]any, error) {
 	input := make(map[string]any, len(mapping))
 	for target, source := range mapping {
-		if def, ok := e.definitions[source]; ok {
-			value, err := e.resolveOne(ctx, event, source, resolved, visiting)
+		if resolveDependency != nil && catalog.Has(source) {
+			value, err := resolveDependency(ctx, source)
 			if err != nil {
 				return nil, err
 			}
 			if !isScalarStatusOK(value) {
 				return nil, fmt.Errorf("mapped input %s=%s is not usable: %s", target, source, value.Status)
 			}
-			if def.DataType == FactorDataTypeStruct || def.DataType == FactorDataTypeList || def.DataType == FactorDataTypeMap {
+			if value.DataType == FactorDataTypeStruct || value.DataType == FactorDataTypeList || value.DataType == FactorDataTypeMap {
 				return nil, fmt.Errorf("mapped input %s=%s must be scalar", target, source)
 			}
 			input[target] = value.Value
@@ -200,6 +139,48 @@ func (e *Engine) resolveMappedInputs(
 			return nil, fmt.Errorf("mapped input %s source %s missing", target, source)
 		}
 		input[target] = raw
+	}
+	return input, nil
+}
+
+func resolveMappedFactorInputs(
+	ctx context.Context,
+	catalog FactorCatalog,
+	event map[string]any,
+	mapping map[string]string,
+	resolveDependency func(ctx context.Context, code string) (FactorValue, error),
+) (map[string]FactorValue, error) {
+	input := make(map[string]FactorValue, len(mapping))
+	for target, source := range mapping {
+		if resolveDependency == nil || !catalog.Has(source) {
+			raw, ok, err := getByPath(event, source)
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
+				return nil, fmt.Errorf("mapped input %s source %s missing", target, source)
+			}
+			input[target] = FactorValue{
+				FactorCode: source,
+				FactorType: FactorTypeEventField,
+				Status:     FactorStatusOK,
+				Value:      raw,
+				ValueText:  stableValueText(raw),
+			}
+			continue
+		}
+
+		value, err := resolveDependency(ctx, source)
+		if err != nil {
+			return nil, err
+		}
+		if !isScalarStatusOK(value) {
+			return nil, fmt.Errorf("mapped input %s=%s is not usable: %s", target, source, value.Status)
+		}
+		if value.DataType == FactorDataTypeStruct || value.DataType == FactorDataTypeList || value.DataType == FactorDataTypeMap {
+			return nil, fmt.Errorf("mapped input %s=%s must be scalar", target, source)
+		}
+		input[target] = value
 	}
 	return input, nil
 }

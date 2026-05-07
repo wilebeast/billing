@@ -62,12 +62,16 @@ func main() {
 	}
 
 	rpcProvider := factor.NewInMemoryRPCProvider()
-	rpcProvider.Register("GET_MERCHANT_LEVEL", func(_ context.Context, _ string, input map[string]any) (any, error) {
+	rpcProvider.Register("GET_MERCHANT_LEVEL", func(_ context.Context, request factor.RPCRequest) (factor.RPCResponse, error) {
+		merchantID, err := request.MustString("merchant_id")
+		if err != nil {
+			return factor.RPCResponse{}, err
+		}
 		level := "NORMAL"
-		if input["merchant_id"] == "m_vip" {
+		if merchantID == "m_vip" {
 			level = "VIP"
 		}
-		return map[string]any{"data": map[string]any{"level": level}}, nil
+		return factor.RPCResponse{Payload: map[string]any{"data": map[string]any{"level": level}}}, nil
 	})
 
 	tableProvider := factor.NewInMemoryTableProvider()

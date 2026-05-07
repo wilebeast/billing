@@ -1,6 +1,9 @@
 package factor
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+)
 
 type FactorType string
 
@@ -111,4 +114,33 @@ type TypedFactorContext struct {
 
 type ExpressionEvalContext struct {
 	Params map[string]any
+}
+
+type FactorCatalog map[string]FactorDefinition
+
+func (c FactorCatalog) Get(code string) (FactorDefinition, bool) {
+	def, ok := c[code]
+	return def, ok
+}
+
+func (c FactorCatalog) Has(code string) bool {
+	_, ok := c[code]
+	return ok
+}
+
+type ResolveRequest struct {
+	Factor            FactorDefinition
+	Catalog           FactorCatalog
+	Event             map[string]any
+	Values            map[string]FactorValue
+	ResolveDependency func(ctx context.Context, code string) (FactorValue, error)
+	RPCProvider       RPCProvider
+	TableProvider     TableProvider
+}
+
+type FactorResolver interface {
+	Type() FactorType
+	Validate(def FactorDefinition, catalog FactorCatalog) error
+	Dependencies(def FactorDefinition, catalog FactorCatalog) ([]string, error)
+	Resolve(ctx context.Context, req ResolveRequest) (FactorValue, error)
 }

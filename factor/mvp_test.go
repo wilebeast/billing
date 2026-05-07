@@ -145,20 +145,23 @@ func TestGetByPathListIndex(t *testing.T) {
 
 func makeRPCProvider() *InMemoryRPCProvider {
 	provider := NewInMemoryRPCProvider()
-	provider.Register("GET_MERCHANT_LEVEL", func(_ context.Context, method string, input map[string]any) (any, error) {
-		if method != "MerchantService.GetMerchantLevel" {
-			return nil, nil
+	provider.Register("GET_MERCHANT_LEVEL", func(_ context.Context, request RPCRequest) (RPCResponse, error) {
+		if request.Method != "MerchantService.GetMerchantLevel" {
+			return RPCResponse{}, nil
 		}
-		merchantID := input["merchant_id"].(string)
+		merchantID, err := request.MustString("merchant_id")
+		if err != nil {
+			return RPCResponse{}, err
+		}
 		level := "NORMAL"
 		if merchantID == "m_vip" {
 			level = "VIP"
 		}
-		return map[string]any{
+		return RPCResponse{Payload: map[string]any{
 			"data": map[string]any{
 				"level": level,
 			},
-		}, nil
+		}}, nil
 	})
 	return provider
 }

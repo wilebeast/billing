@@ -7,15 +7,37 @@ import (
 	"strings"
 )
 
+type RPCRequest struct {
+	ProviderCode string
+	Method       string
+	Inputs       map[string]FactorValue
+}
+
+func (r RPCRequest) MustString(name string) (string, error) {
+	value, ok := r.Inputs[name]
+	if !ok {
+		return "", fmt.Errorf("rpc input %s not found", name)
+	}
+	raw, ok := value.Value.(string)
+	if !ok {
+		return "", fmt.Errorf("rpc input %s type = %T, want string", name, value.Value)
+	}
+	return raw, nil
+}
+
+type RPCResponse struct {
+	Payload map[string]any
+}
+
 type RPCProvider interface {
-	Call(ctx context.Context, providerCode, method string, input map[string]any) (any, error)
+	Call(ctx context.Context, request RPCRequest) (RPCResponse, error)
 }
 
 type TableProvider interface {
 	Lookup(ctx context.Context, tableCode string, key map[string]any) (any, error)
 }
 
-type RPCHandler func(ctx context.Context, method string, input map[string]any) (any, error)
+type RPCHandler func(ctx context.Context, request RPCRequest) (RPCResponse, error)
 
 type InMemoryRPCProvider struct {
 	handlers map[string]RPCHandler
@@ -29,12 +51,12 @@ func (p *InMemoryRPCProvider) Register(providerCode string, handler RPCHandler) 
 	p.handlers[providerCode] = handler
 }
 
-func (p *InMemoryRPCProvider) Call(ctx context.Context, providerCode, method string, input map[string]any) (any, error) {
-	handler, ok := p.handlers[providerCode]
+func (p *InMemoryRPCProvider) Call(ctx context.Context, request RPCRequest) (RPCResponse, error) {
+	handler, ok := p.handlers[request.ProviderCode]
 	if !ok {
-		return nil, fmt.Errorf("rpc provider %s not found", providerCode)
+		return RPCResponse{}, fmt.Errorf("rpc provider %s not found", request.ProviderCode)
 	}
-	return handler(ctx, method, input)
+	return handler(ctx, request)
 }
 
 type InMemoryTableProvider struct {
