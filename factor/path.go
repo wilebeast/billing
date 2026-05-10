@@ -3,8 +3,10 @@ package factor
 import (
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"strconv"
 	"strings"
+	"time"
 )
 
 func getByPath(value any, path string) (any, bool, error) {
@@ -57,11 +59,18 @@ func stableValueText(value any) string {
 		return strconv.FormatInt(typed, 10)
 	case float64:
 		return strconv.FormatFloat(typed, 'f', -1, 64)
+	case *big.Rat:
+		if typed == nil {
+			return "null"
+		}
+		return typed.FloatString(12)
 	case bool:
 		if typed {
 			return "true"
 		}
 		return "false"
+	case time.Time:
+		return typed.UTC().Format(time.RFC3339Nano)
 	default:
 		raw, err := json.Marshal(typed)
 		if err != nil {

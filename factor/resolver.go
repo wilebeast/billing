@@ -3,69 +3,71 @@ package factor
 import (
 	"context"
 	"fmt"
-	"strconv"
 )
 
 type Engine struct {
-	definitions map[string]FactorDefinition
-	resolvers   map[FactorType]FactorResolver
+	registry    *Registry
 	rpcProvider RPCProvider
 	table       TableProvider
+	ruleTable   RuleTableRepository
 }
 
 func NewEngine(definitions []FactorDefinition, rpcProvider RPCProvider, table TableProvider) (*Engine, error) {
-	resolvers := map[FactorType]FactorResolver{
-		FactorTypeEventField: EventFieldResolver{},
-		FactorTypeExpression: ExpressionResolver{},
-		FactorTypeRPC:        RPCResolver{},
-		FactorTypeTable:      TableLookupResolver{},
-	}
-	defs := make(map[string]FactorDefinition, len(definitions))
-	catalog := FactorCatalog(defs)
-	for _, def := range definitions {
-		resolver, ok := resolvers[def.Type]
-		if !ok {
-			return nil, fmt.Errorf("factor %s: unsupported factor type %s", def.Code, def.Type)
-		}
-		if err := resolver.Validate(def, catalog); err != nil {
-			return nil, err
-		}
-		defs[def.Code] = def
+	registry, err := NewRegistry(
+		definitions,
+		EventFieldResolver{},
+		ExpressionResolver{},
+		RPCResolver{},
+		TableLookupResolver{},
+		RuleTableResolver{},
+		RateMatchResolver{},
+		ConstantResolver{},
+	)
+	if err != nil {
+		return nil, err
 	}
 
 	return &Engine{
-		definitions: defs,
-		resolvers:   resolvers,
+		registry:    registry,
 		rpcProvider: rpcProvider,
 		table:       table,
+		ruleTable:   inferRuleTableRepository(table),
 	}, nil
 }
 
 func (e *Engine) Resolve(ctx context.Context, event map[string]any, targetCodes []string) (TypedFactorContext, error) {
+	return e.ResolveWithContext(ctx, NewCalculationContext(event, ChargeObject{}), targetCodes)
+}
+
+func (e *Engine) ResolveWithContext(ctx context.Context, calcCtx CalculationContext, targetCodes []string) (TypedFactorContext, error) {
 	result := TypedFactorContext{Factors: map[string]FactorValue{}}
-	visiting := map[string]bool{}
+	values := NewInMemoryFactorValueStore()
+	visiting := map[FactorCode]bool{}
 
 	for _, code := range targetCodes {
-		if _, err := e.resolveOne(ctx, event, code, result.Factors, visiting); err != nil {
+		if _, err := e.resolveOne(ctx, calcCtx, FactorCode(code), values, visiting); err != nil {
 			return TypedFactorContext{}, err
 		}
 	}
 
+	for code, value := range values.All() {
+		result.Factors[string(code)] = value
+	}
 	return result, nil
 }
 
 func (e *Engine) resolveOne(
 	ctx context.Context,
-	event map[string]any,
-	code string,
-	resolved map[string]FactorValue,
-	visiting map[string]bool,
+	event NormalizedEvent,
+	code FactorCode,
+	values FactorValueStore,
+	visiting map[FactorCode]bool,
 ) (FactorValue, error) {
-	if value, ok := resolved[code]; ok {
+	if value, ok := values.Get(code); ok {
 		return value, nil
 	}
 
-	def, ok := e.definitions[code]
+	factor, ok := e.registry.Get(code)
 	if !ok {
 		return FactorValue{}, fmt.Errorf("factor %s not defined", code)
 	}
@@ -76,62 +78,74 @@ func (e *Engine) resolveOne(
 	visiting[code] = true
 	defer delete(visiting, code)
 
-	resolver, ok := e.resolvers[def.Type]
-	if !ok {
-		return FactorValue{}, fmt.Errorf("factor %s type %s not supported", def.Code, def.Type)
-	}
-
-	value, err := resolver.Resolve(ctx, ResolveRequest{
+	def := factor.Definition()
+	value, err := factor.Resolve(ctx, ResolveRequest{
 		Factor:  def,
-		Catalog: FactorCatalog(e.definitions),
+		Catalog: e.registry.Catalog(),
 		Event:   event,
-		Values:  resolved,
-		ResolveDependency: func(ctx context.Context, dependency string) (FactorValue, error) {
-			return e.resolveOne(ctx, event, dependency, resolved, visiting)
+		Values:  values,
+		ResolveDependency: func(ctx context.Context, dependency FactorCode) (FactorValue, error) {
+			return e.resolveOne(ctx, event, dependency, values, visiting)
 		},
 		RPCProvider:   e.rpcProvider,
 		TableProvider: e.table,
+		RuleProvider:  e.ruleTable,
 	})
 	if err != nil {
 		if def.DefaultValue != nil {
-			defaulted, defaultErr := buildFactorValue(def, FactorStatusDefaulted, *def.DefaultValue)
+			defaulted, defaultErr := buildDefaultedFactorValue(def)
 			if defaultErr == nil {
-				resolved[code] = defaulted
+				values.Set(code, defaulted)
 				return defaulted, nil
 			}
 		}
 		return FactorValue{}, err
 	}
 
-	resolved[code] = value
+	values.Set(code, value)
 	return value, nil
+}
+
+func inferRuleTableRepository(table TableProvider) RuleTableRepository {
+	if table == nil {
+		return nil
+	}
+	repo, ok := table.(RuleTableRepository)
+	if !ok {
+		return nil
+	}
+	return repo
 }
 
 func resolveMappedInputs(
 	ctx context.Context,
 	catalog FactorCatalog,
-	event map[string]any,
+	event NormalizedEvent,
 	mapping map[string]string,
-	resolveDependency func(ctx context.Context, code string) (FactorValue, error),
+	resolveDependency func(ctx context.Context, code FactorCode) (FactorValue, error),
 ) (map[string]any, error) {
 	input := make(map[string]any, len(mapping))
 	for target, source := range mapping {
 		if resolveDependency != nil && catalog.Has(source) {
-			value, err := resolveDependency(ctx, source)
+			value, err := resolveDependency(ctx, FactorCode(source))
 			if err != nil {
 				return nil, err
 			}
 			if !isScalarStatusOK(value) {
 				return nil, fmt.Errorf("mapped input %s=%s is not usable: %s", target, source, value.Status)
 			}
-			if value.DataType == FactorDataTypeStruct || value.DataType == FactorDataTypeList || value.DataType == FactorDataTypeMap {
+			if value.DataType == FactorDataTypeObject || value.DataType == FactorDataTypeArray {
 				return nil, fmt.Errorf("mapped input %s=%s must be scalar", target, source)
 			}
-			input[target] = value.Value
+			param, err := value.ToExpressionParam()
+			if err != nil {
+				return nil, err
+			}
+			input[target] = param
 			continue
 		}
 
-		raw, ok, err := getByPath(event, source)
+		raw, ok, err := event.GetByPath(source)
 		if err != nil {
 			return nil, err
 		}
@@ -146,14 +160,14 @@ func resolveMappedInputs(
 func resolveMappedFactorInputs(
 	ctx context.Context,
 	catalog FactorCatalog,
-	event map[string]any,
+	event NormalizedEvent,
 	mapping map[string]string,
-	resolveDependency func(ctx context.Context, code string) (FactorValue, error),
+	resolveDependency func(ctx context.Context, code FactorCode) (FactorValue, error),
 ) (map[string]FactorValue, error) {
 	input := make(map[string]FactorValue, len(mapping))
 	for target, source := range mapping {
 		if resolveDependency == nil || !catalog.Has(source) {
-			raw, ok, err := getByPath(event, source)
+			raw, ok, err := event.GetByPath(source)
 			if err != nil {
 				return nil, err
 			}
@@ -161,23 +175,24 @@ func resolveMappedFactorInputs(
 				return nil, fmt.Errorf("mapped input %s source %s missing", target, source)
 			}
 			input[target] = FactorValue{
-				FactorCode: source,
+				Code:       FactorCode(source),
 				FactorType: FactorTypeEventField,
 				Status:     FactorStatusOK,
 				Value:      raw,
+				RawValue:   raw,
 				ValueText:  stableValueText(raw),
 			}
 			continue
 		}
 
-		value, err := resolveDependency(ctx, source)
+		value, err := resolveDependency(ctx, FactorCode(source))
 		if err != nil {
 			return nil, err
 		}
 		if !isScalarStatusOK(value) {
 			return nil, fmt.Errorf("mapped input %s=%s is not usable: %s", target, source, value.Status)
 		}
-		if value.DataType == FactorDataTypeStruct || value.DataType == FactorDataTypeList || value.DataType == FactorDataTypeMap {
+		if value.DataType == FactorDataTypeObject || value.DataType == FactorDataTypeArray {
 			return nil, fmt.Errorf("mapped input %s=%s must be scalar", target, source)
 		}
 		input[target] = value
@@ -190,87 +205,30 @@ func isScalarStatusOK(value FactorValue) bool {
 		return false
 	}
 	switch value.DataType {
-	case FactorDataTypeStruct, FactorDataTypeList, FactorDataTypeMap:
+	case FactorDataTypeObject, FactorDataTypeArray:
 		return false
 	default:
 		return true
 	}
 }
 
-func buildFactorValue(def FactorDefinition, status FactorStatus, raw any) (FactorValue, error) {
-	normalized, err := normalizeValue(def.DataType, raw)
+func buildFactorValue(def FactorDefinition, raw any, source FactorSource) (FactorValue, error) {
+	normalized, err := NormalizeRawValue(raw, def.DataType)
 	if err != nil {
 		return FactorValue{}, fmt.Errorf("factor %s normalize: %w", def.Code, err)
 	}
-	return FactorValue{
-		FactorCode: def.Code,
-		FactorType: def.Type,
-		DataType:   def.DataType,
-		Status:     status,
-		Value:      normalized,
-		ValueText:  stableValueText(normalized),
-	}, nil
+	return NewOKFactorValue(def.Code, def.DataType, normalized, raw, source), nil
 }
 
-func normalizeValue(dataType FactorDataType, raw any) (any, error) {
-	switch dataType {
-	case FactorDataTypeDecimal:
-		switch v := raw.(type) {
-		case string:
-			f, err := strconv.ParseFloat(v, 64)
-			if err != nil {
-				return nil, err
-			}
-			return f, nil
-		case int:
-			return float64(v), nil
-		case int64:
-			return float64(v), nil
-		case float64:
-			return v, nil
-		default:
-			return nil, fmt.Errorf("unsupported decimal source %T", raw)
-		}
-	case FactorDataTypeString:
-		switch v := raw.(type) {
-		case string:
-			return v, nil
-		default:
-			return stableValueText(v), nil
-		}
-	case FactorDataTypeInt:
-		switch v := raw.(type) {
-		case int:
-			return v, nil
-		case int64:
-			return int(v), nil
-		case float64:
-			return int(v), nil
-		case string:
-			i, err := strconv.Atoi(v)
-			if err != nil {
-				return nil, err
-			}
-			return i, nil
-		default:
-			return nil, fmt.Errorf("unsupported int source %T", raw)
-		}
-	case FactorDataTypeBool:
-		switch v := raw.(type) {
-		case bool:
-			return v, nil
-		case string:
-			b, err := strconv.ParseBool(v)
-			if err != nil {
-				return nil, err
-			}
-			return b, nil
-		default:
-			return nil, fmt.Errorf("unsupported bool source %T", raw)
-		}
-	case FactorDataTypeDatetime, FactorDataTypeStruct, FactorDataTypeList, FactorDataTypeMap:
-		return raw, nil
-	default:
-		return raw, nil
+func buildDefaultedFactorValue(def FactorDefinition) (FactorValue, error) {
+	source := FactorSource{
+		FactorType: def.Type,
+		Scope:      def.Scope,
+		Version:    def.Version,
 	}
+	normalized, err := NormalizeRawValue(*def.DefaultValue, def.DataType)
+	if err != nil {
+		return FactorValue{}, fmt.Errorf("factor %s default normalize: %w", def.Code, err)
+	}
+	return NewDefaultedFactorValue(def.Code, def.Type, def.DataType, normalized, *def.DefaultValue, source), nil
 }
