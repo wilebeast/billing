@@ -172,7 +172,7 @@ func TestRegistryBuildsRuntimeFactors(t *testing.T) {
 				OutputPath:   "$.data.level",
 			},
 		},
-	}, EventFieldResolver{}, RPCResolver{})
+	})
 	if err != nil {
 		t.Fatalf("NewRegistry: %v", err)
 	}
@@ -181,9 +181,84 @@ func TestRegistryBuildsRuntimeFactors(t *testing.T) {
 	if !ok {
 		t.Fatalf("runtime factor not found")
 	}
-	deps := factor.Dependencies()
-	if len(deps) != 1 || deps[0] != "merchant_id" {
-		t.Fatalf("deps = %v, want [merchant_id]", deps)
+	if factor == nil {
+		t.Fatalf("runtime factor is nil")
+	}
+	def, ok := registry.Definition("merchant_level")
+	if !ok {
+		t.Fatalf("definition not found")
+	}
+	if def.Type != FactorTypeRPC {
+		t.Fatalf("definition type = %s, want RPC", def.Type)
+	}
+}
+
+func TestCalculationContextBuilderBuildsOrderContext(t *testing.T) {
+	builder := NewCalculationContextBuilder()
+	ctx := builder.BuildOrder(map[string]any{
+		"payment_method": "CARD",
+	})
+
+	if ctx.ChargeObject.Scope != FactorScopeOrder {
+		t.Fatalf("scope = %s, want ORDER", ctx.ChargeObject.Scope)
+	}
+	value, ok, err := ctx.GetByScope(FactorScopeOrder, "$.payment_method")
+	if err != nil {
+		t.Fatalf("GetByScope: %v", err)
+	}
+	if !ok || value != "CARD" {
+		t.Fatalf("value = %#v, ok = %v", value, ok)
+	}
+}
+
+func TestFactorExecutorResolvesDependencies(t *testing.T) {
+	registry, err := NewRegistry([]FactorDefinition{
+		{
+			Code:     "payment_amount",
+			Type:     FactorTypeEventField,
+			Scope:    FactorScopeOrder,
+			DataType: FactorDataTypeDecimal,
+			EventField: &EventFieldConfig{
+				SourcePath: "$.payment.amount",
+			},
+		},
+		{
+			Code:     "service_fee_rate",
+			Type:     FactorTypeConstant,
+			Scope:    FactorScopeOrder,
+			DataType: FactorDataTypeDecimal,
+			Constant: &ConstantConfig{
+				Value: "0.20",
+			},
+		},
+		{
+			Code:     "service_fee_amount",
+			Type:     FactorTypeExpression,
+			Scope:    FactorScopeOrder,
+			DataType: FactorDataTypeDecimal,
+			Expression: &ExpressionConfig{
+				Expression: "payment_amount * service_fee_rate",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+
+	executor := NewFactorExecutor(registry, ExecutorDependencies{})
+	values, err := executor.ResolveFactors(context.Background(), NewCalculationContext(map[string]any{
+		"payment": map[string]any{"amount": 100.0},
+	}, ChargeObject{Scope: FactorScopeOrder}), []FactorCode{"service_fee_amount"})
+	if err != nil {
+		t.Fatalf("ResolveFactors: %v", err)
+	}
+
+	got, err := values["service_fee_amount"].AsDecimal()
+	if err != nil {
+		t.Fatalf("AsDecimal: %v", err)
+	}
+	if got.Cmp(big.NewRat(20, 1)) != 0 {
+		t.Fatalf("service_fee_amount = %s, want 20", got.FloatString(6))
 	}
 }
 

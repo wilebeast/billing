@@ -1,82 +1,53 @@
 package factor
 
-import (
-	"context"
-	"fmt"
-)
-
-type ResolverRegistry struct {
-	resolvers map[FactorType]FactorResolver
-}
-
-func NewResolverRegistry(resolvers ...FactorResolver) *ResolverRegistry {
-	m := make(map[FactorType]FactorResolver, len(resolvers))
-	for _, resolver := range resolvers {
-		m[resolver.Type()] = resolver
-	}
-	return &ResolverRegistry{resolvers: m}
-}
-
-func (r *ResolverRegistry) Get(t FactorType) (FactorResolver, bool) {
-	if r == nil {
-		return nil, false
-	}
-	resolver, ok := r.resolvers[t]
-	return resolver, ok
-}
-
-type RuntimeFactor struct {
-	definition   FactorDefinition
-	resolver     FactorResolver
-	dependencies []FactorCode
-}
-
-func (f RuntimeFactor) Code() FactorCode             { return f.definition.Code }
-func (f RuntimeFactor) Definition() FactorDefinition { return f.definition }
-func (f RuntimeFactor) Dependencies() []FactorCode {
-	return append([]FactorCode(nil), f.dependencies...)
-}
-func (f RuntimeFactor) Resolve(ctx context.Context, req ResolveRequest) (FactorValue, error) {
-	return f.resolver.Resolve(ctx, req)
-}
+import "fmt"
 
 type FactorFactory struct {
-	resolvers *ResolverRegistry
+	providers map[FactorType]FactorProvider
 }
 
-func NewFactorFactory(resolvers *ResolverRegistry) *FactorFactory {
-	return &FactorFactory{resolvers: resolvers}
+func NewFactorFactory(providers ...FactorProvider) *FactorFactory {
+	factory := &FactorFactory{providers: map[FactorType]FactorProvider{}}
+	for _, provider := range providers {
+		factory.Register(provider)
+	}
+	return factory
 }
 
-func (f *FactorFactory) Create(def FactorDefinition, catalog FactorCatalog) (Factor, error) {
-	resolver, ok := f.resolvers.Get(def.Type)
+func (f *FactorFactory) Register(provider FactorProvider) {
+	if f.providers == nil {
+		f.providers = map[FactorType]FactorProvider{}
+	}
+	f.providers[provider.Type()] = provider
+}
+
+func (f *FactorFactory) Create(def FactorDefinition) (Factor, error) {
+	provider, ok := f.providers[def.Type]
 	if !ok {
-		return nil, fmt.Errorf("factor %s: resolver not found for type %s", def.Code, def.Type)
+		return nil, fmt.Errorf("factor %s: provider not found for type %s", def.Code, def.Type)
 	}
-	if err := resolver.Validate(def, catalog); err != nil {
-		return nil, err
-	}
-	deps, err := resolver.Dependencies(def, catalog)
-	if err != nil {
-		return nil, err
-	}
-	return RuntimeFactor{
-		definition:   def,
-		resolver:     resolver,
-		dependencies: deps,
-	}, nil
+	return provider.NewFactor(def)
 }
 
 type Registry struct {
-	catalog   FactorCatalog
-	factors   map[FactorCode]Factor
-	factory   *FactorFactory
-	resolvers *ResolverRegistry
+	catalog FactorCatalog
+	factors map[FactorCode]Factor
+	factory *FactorFactory
 }
 
-func NewRegistry(definitions []FactorDefinition, resolvers ...FactorResolver) (*Registry, error) {
-	resolverRegistry := NewResolverRegistry(resolvers...)
-	factory := NewFactorFactory(resolverRegistry)
+func NewRegistry(definitions []FactorDefinition) (*Registry, error) {
+	return NewRegistryWithFactory(definitions, NewFactorFactory(
+		EventFieldFactorProvider{},
+		ExpressionFactorProvider{},
+		RPCFactorProvider{},
+		TableLookupFactorProvider{},
+		RuleTableFactorProvider{},
+		RateMatchFactorProvider{},
+		ConstantFactorProvider{},
+	))
+}
+
+func NewRegistryWithFactory(definitions []FactorDefinition, factory *FactorFactory) (*Registry, error) {
 	catalog := make(FactorCatalog, len(definitions))
 	for _, def := range definitions {
 		if _, exists := catalog[def.Code]; exists {
@@ -87,7 +58,7 @@ func NewRegistry(definitions []FactorDefinition, resolvers ...FactorResolver) (*
 
 	factors := make(map[FactorCode]Factor, len(definitions))
 	for _, def := range definitions {
-		factor, err := factory.Create(def, catalog)
+		factor, err := factory.Create(def)
 		if err != nil {
 			return nil, err
 		}
@@ -95,15 +66,19 @@ func NewRegistry(definitions []FactorDefinition, resolvers ...FactorResolver) (*
 	}
 
 	return &Registry{
-		catalog:   catalog,
-		factors:   factors,
-		factory:   factory,
-		resolvers: resolverRegistry,
+		catalog: catalog,
+		factors: factors,
+		factory: factory,
 	}, nil
 }
 
 func (r *Registry) Catalog() FactorCatalog {
 	return r.catalog
+}
+
+func (r *Registry) Definition(code FactorCode) (FactorDefinition, bool) {
+	def, ok := r.catalog[code]
+	return def, ok
 }
 
 func (r *Registry) Get(code FactorCode) (Factor, bool) {

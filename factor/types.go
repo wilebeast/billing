@@ -378,16 +378,11 @@ type ResolveRequest struct {
 	RuleProvider      RuleTableRepository
 }
 
-type FactorResolver interface {
-	Type() FactorType
-	Validate(def FactorDefinition, catalog FactorCatalog) error
-	Dependencies(def FactorDefinition, catalog FactorCatalog) ([]FactorCode, error)
+type Factor interface {
 	Resolve(ctx context.Context, req ResolveRequest) (FactorValue, error)
 }
 
-type Factor interface {
-	Code() FactorCode
-	Definition() FactorDefinition
-	Dependencies() []FactorCode
-	Resolve(ctx context.Context, req ResolveRequest) (FactorValue, error)
+type FactorProvider interface {
+	Type() FactorType
+	NewFactor(def FactorDefinition) (Factor, error)
 }

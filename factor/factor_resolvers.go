@@ -6,37 +6,33 @@ import (
 	"time"
 )
 
-type EventFieldResolver struct{}
+type EventFieldFactorProvider struct{}
 
-func (r EventFieldResolver) Type() FactorType { return FactorTypeEventField }
-
-func (r EventFieldResolver) Validate(def FactorDefinition, _ FactorCatalog) error {
+func (p EventFieldFactorProvider) Type() FactorType { return FactorTypeEventField }
+func (p EventFieldFactorProvider) NewFactor(def FactorDefinition) (Factor, error) {
 	cfg, err := def.eventFieldConfig()
 	if err != nil {
-		return fmt.Errorf("factor %s: decode event field config: %w", def.Code, err)
+		return nil, fmt.Errorf("factor %s: decode event field config: %w", def.Code, err)
 	}
 	if cfg == nil || cfg.SourcePath == "" {
-		return fmt.Errorf("factor %s: missing event field config", def.Code)
+		return nil, fmt.Errorf("factor %s: missing event field config", def.Code)
 	}
-	return nil
+	return EventFieldFactor{definition: def, config: *cfg}, nil
 }
 
-func (r EventFieldResolver) Dependencies(_ FactorDefinition, _ FactorCatalog) ([]FactorCode, error) {
-	return nil, nil
+type EventFieldFactor struct {
+	definition FactorDefinition
+	config     EventFieldConfig
 }
 
-func (r EventFieldResolver) Resolve(_ context.Context, req ResolveRequest) (FactorValue, error) {
-	cfg, err := req.Factor.eventFieldConfig()
-	if err != nil {
-		return FactorValue{}, err
-	}
+func (f EventFieldFactor) Resolve(_ context.Context, req ResolveRequest) (FactorValue, error) {
 	source := FactorSource{
 		FactorType: req.Factor.Type,
 		Scope:      req.Factor.Scope,
-		SourcePath: cfg.SourcePath,
+		SourcePath: f.config.SourcePath,
 		Version:    req.Factor.Version,
 	}
-	raw, ok, err := getScopedValue(req.Event, req.Factor.Scope, cfg.SourcePath)
+	raw, ok, err := getScopedValue(req.Event, req.Factor.Scope, f.config.SourcePath)
 	if err != nil {
 		return NewFailedFactorValue(req.Factor.Code, req.Factor.DataType, source, "FIELD_READ_ERROR", err.Error()), nil
 	}
@@ -56,29 +52,31 @@ func (r EventFieldResolver) Resolve(_ context.Context, req ResolveRequest) (Fact
 	return NewOKFactorValue(req.Factor.Code, req.Factor.DataType, value, raw, source), nil
 }
 
-type ExpressionResolver struct{}
-
-func (r ExpressionResolver) Type() FactorType { return FactorTypeExpression }
-
-func (r ExpressionResolver) Validate(def FactorDefinition, _ FactorCatalog) error {
-	cfg, err := def.expressionConfig()
-	if err != nil {
-		return fmt.Errorf("factor %s: decode expression config: %w", def.Code, err)
-	}
-	if cfg == nil || cfg.Expression == "" {
-		return fmt.Errorf("factor %s: missing expression config", def.Code)
-	}
-	return nil
+type ExpressionFactor struct {
+	definition   FactorDefinition
+	config       ExpressionConfig
+	dependencies []FactorCode
 }
 
-func (r ExpressionResolver) Dependencies(def FactorDefinition, _ FactorCatalog) ([]FactorCode, error) {
+type ExpressionFactorProvider struct{}
+
+func (p ExpressionFactorProvider) Type() FactorType { return FactorTypeExpression }
+func (p ExpressionFactorProvider) NewFactor(def FactorDefinition) (Factor, error) {
 	cfg, err := def.expressionConfig()
+	if err != nil {
+		return nil, fmt.Errorf("factor %s: decode expression config: %w", def.Code, err)
+	}
+	if cfg == nil || cfg.Expression == "" {
+		return nil, fmt.Errorf("factor %s: missing expression config", def.Code)
+	}
+	deps, err := expressionDependencies(*cfg)
 	if err != nil {
 		return nil, err
 	}
-	if cfg == nil {
-		return nil, fmt.Errorf("factor %s: missing expression config", def.Code)
-	}
+	return ExpressionFactor{definition: def, config: *cfg, dependencies: deps}, nil
+}
+
+func expressionDependencies(cfg ExpressionConfig) ([]FactorCode, error) {
 	if len(cfg.DependFactors) > 0 {
 		deps := make([]FactorCode, 0, len(cfg.DependFactors))
 		for _, dep := range cfg.DependFactors {
@@ -97,21 +95,9 @@ func (r ExpressionResolver) Dependencies(def FactorDefinition, _ FactorCatalog) 
 	return deps, nil
 }
 
-func (r ExpressionResolver) Resolve(ctx context.Context, req ResolveRequest) (FactorValue, error) {
-	cfg, err := req.Factor.expressionConfig()
-	if err != nil {
-		return FactorValue{}, err
-	}
-	deps := cfg.DependFactors
-	if len(deps) == 0 {
-		deps, err = expressionVariables(cfg.Expression)
-		if err != nil {
-			return FactorValue{}, err
-		}
-	}
-
+func (f ExpressionFactor) Resolve(ctx context.Context, req ResolveRequest) (FactorValue, error) {
 	params := map[string]any{}
-	for _, dep := range deps {
+	for _, dep := range f.dependencies {
 		value, err := req.ResolveDependency(ctx, FactorCode(dep))
 		if err != nil {
 			return FactorValue{}, err
@@ -123,58 +109,50 @@ func (r ExpressionResolver) Resolve(ctx context.Context, req ResolveRequest) (Fa
 		if err != nil {
 			return FactorValue{}, err
 		}
-		params[dep] = param
+		params[string(dep)] = param
 	}
 
-	raw, err := evaluateExpression(cfg.Expression, params)
+	raw, err := evaluateExpression(f.config.Expression, params)
 	if err != nil {
 		return FactorValue{}, err
 	}
 	source := FactorSource{
 		FactorType: req.Factor.Type,
 		Scope:      req.Factor.Scope,
-		Expression: cfg.Expression,
+		Expression: f.config.Expression,
 		Version:    req.Factor.Version,
 	}
 	return buildFactorValue(req.Factor, raw, source)
 }
 
-type RPCResolver struct{}
+type RPCFactor struct {
+	definition FactorDefinition
+	config     RPCConfig
+}
 
-func (r RPCResolver) Type() FactorType { return FactorTypeRPC }
+type RPCFactorProvider struct{}
 
-func (r RPCResolver) Validate(def FactorDefinition, _ FactorCatalog) error {
+func (p RPCFactorProvider) Type() FactorType { return FactorTypeRPC }
+func (p RPCFactorProvider) NewFactor(def FactorDefinition) (Factor, error) {
 	cfg, err := def.rpcConfig()
 	if err != nil {
-		return fmt.Errorf("factor %s: decode rpc config: %w", def.Code, err)
+		return nil, fmt.Errorf("factor %s: decode rpc config: %w", def.Code, err)
 	}
 	if cfg == nil || cfg.ProviderCode == "" || cfg.Method == "" {
-		return fmt.Errorf("factor %s: missing rpc config", def.Code)
+		return nil, fmt.Errorf("factor %s: missing rpc config", def.Code)
 	}
-	return nil
+	return RPCFactor{definition: def, config: *cfg}, nil
 }
 
-func (r RPCResolver) Dependencies(def FactorDefinition, catalog FactorCatalog) ([]FactorCode, error) {
-	cfg, err := def.rpcConfig()
-	if err != nil {
-		return nil, err
-	}
-	return mappingDependencies(cfg.InputMapping, catalog), nil
-}
-
-func (r RPCResolver) Resolve(ctx context.Context, req ResolveRequest) (FactorValue, error) {
-	cfg, err := req.Factor.rpcConfig()
-	if err != nil {
-		return FactorValue{}, err
-	}
-	inputs, err := resolveMappedFactorInputs(ctx, req.Catalog, req.Event, cfg.InputMapping, req.ResolveDependency)
+func (f RPCFactor) Resolve(ctx context.Context, req ResolveRequest) (FactorValue, error) {
+	inputs, err := resolveMappedFactorInputs(ctx, req.Catalog, req.Event, f.config.InputMapping, req.ResolveDependency)
 	if err != nil {
 		return FactorValue{}, err
 	}
 
 	response, err := req.RPCProvider.Call(ctx, RPCRequest{
-		ProviderCode: cfg.ProviderCode,
-		Method:       cfg.Method,
+		ProviderCode: f.config.ProviderCode,
+		Method:       f.config.Method,
 		Inputs:       inputs,
 	})
 	if err != nil {
@@ -182,8 +160,8 @@ func (r RPCResolver) Resolve(ctx context.Context, req ResolveRequest) (FactorVal
 	}
 
 	raw := any(response.Payload)
-	if cfg.OutputPath != "" {
-		raw, _, err = getByPath(raw, cfg.OutputPath)
+	if f.config.OutputPath != "" {
+		raw, _, err = getByPath(raw, f.config.OutputPath)
 		if err != nil {
 			return FactorValue{}, err
 		}
@@ -191,53 +169,45 @@ func (r RPCResolver) Resolve(ctx context.Context, req ResolveRequest) (FactorVal
 	source := FactorSource{
 		FactorType:   req.Factor.Type,
 		Scope:        req.Factor.Scope,
-		ProviderCode: cfg.ProviderCode,
-		Method:       cfg.Method,
-		ResponsePath: cfg.OutputPath,
+		ProviderCode: f.config.ProviderCode,
+		Method:       f.config.Method,
+		ResponsePath: f.config.OutputPath,
 		Version:      req.Factor.Version,
 	}
 	return buildFactorValue(req.Factor, raw, source)
 }
 
-type TableLookupResolver struct{}
+type TableLookupFactor struct {
+	definition FactorDefinition
+	config     TableLookupConfig
+}
 
-func (r TableLookupResolver) Type() FactorType { return FactorTypeTable }
+type TableLookupFactorProvider struct{}
 
-func (r TableLookupResolver) Validate(def FactorDefinition, _ FactorCatalog) error {
+func (p TableLookupFactorProvider) Type() FactorType { return FactorTypeTableLookup }
+func (p TableLookupFactorProvider) NewFactor(def FactorDefinition) (Factor, error) {
 	cfg, err := def.tableLookupConfig()
 	if err != nil {
-		return fmt.Errorf("factor %s: decode table config: %w", def.Code, err)
+		return nil, fmt.Errorf("factor %s: decode table config: %w", def.Code, err)
 	}
 	if cfg == nil || cfg.TableCode == "" || len(cfg.LookupKey) == 0 {
-		return fmt.Errorf("factor %s: missing table config", def.Code)
+		return nil, fmt.Errorf("factor %s: missing table config", def.Code)
 	}
-	return nil
+	return TableLookupFactor{definition: def, config: *cfg}, nil
 }
 
-func (r TableLookupResolver) Dependencies(def FactorDefinition, catalog FactorCatalog) ([]FactorCode, error) {
-	cfg, err := def.tableLookupConfig()
-	if err != nil {
-		return nil, err
-	}
-	return mappingDependencies(cfg.LookupKey, catalog), nil
-}
-
-func (r TableLookupResolver) Resolve(ctx context.Context, req ResolveRequest) (FactorValue, error) {
-	cfg, err := req.Factor.tableLookupConfig()
-	if err != nil {
-		return FactorValue{}, err
-	}
-	key, err := resolveMappedInputs(ctx, req.Catalog, req.Event, cfg.LookupKey, req.ResolveDependency)
+func (f TableLookupFactor) Resolve(ctx context.Context, req ResolveRequest) (FactorValue, error) {
+	key, err := resolveMappedInputs(ctx, req.Catalog, req.Event, f.config.LookupKey, req.ResolveDependency)
 	if err != nil {
 		return FactorValue{}, err
 	}
 
-	raw, err := req.TableProvider.Lookup(ctx, cfg.TableCode, key)
+	raw, err := req.TableProvider.Lookup(ctx, f.config.TableCode, key)
 	if err != nil {
 		return FactorValue{}, err
 	}
-	if cfg.OutputPath != "" {
-		raw, _, err = getByPath(raw, cfg.OutputPath)
+	if f.config.OutputPath != "" {
+		raw, _, err = getByPath(raw, f.config.OutputPath)
 		if err != nil {
 			return FactorValue{}, err
 		}
@@ -245,63 +215,55 @@ func (r TableLookupResolver) Resolve(ctx context.Context, req ResolveRequest) (F
 	source := FactorSource{
 		FactorType: req.Factor.Type,
 		Scope:      req.Factor.Scope,
-		TableCode:  cfg.TableCode,
+		TableCode:  f.config.TableCode,
 		LookupKey:  key,
 		Version:    req.Factor.Version,
 	}
 	return buildFactorValue(req.Factor, raw, source)
 }
 
-type RuleTableResolver struct{}
+type RuleTableFactor struct {
+	definition FactorDefinition
+	config     RuleTableConfig
+}
 
-func (r RuleTableResolver) Type() FactorType { return FactorTypeRuleTable }
+type RuleTableFactorProvider struct{}
 
-func (r RuleTableResolver) Validate(def FactorDefinition, _ FactorCatalog) error {
+func (p RuleTableFactorProvider) Type() FactorType { return FactorTypeRuleTable }
+func (p RuleTableFactorProvider) NewFactor(def FactorDefinition) (Factor, error) {
 	cfg, err := def.ruleTableConfig()
 	if err != nil {
-		return fmt.Errorf("factor %s: decode rule table config: %w", def.Code, err)
+		return nil, fmt.Errorf("factor %s: decode rule table config: %w", def.Code, err)
 	}
 	if cfg == nil || cfg.RuleTableCode == "" || len(cfg.InputMapping) == 0 {
-		return fmt.Errorf("factor %s: missing rule table config", def.Code)
+		return nil, fmt.Errorf("factor %s: missing rule table config", def.Code)
 	}
-	return nil
+	return RuleTableFactor{definition: def, config: *cfg}, nil
 }
 
-func (r RuleTableResolver) Dependencies(def FactorDefinition, catalog FactorCatalog) ([]FactorCode, error) {
-	cfg, err := def.ruleTableConfig()
-	if err != nil {
-		return nil, err
-	}
-	return mappingDependencies(cfg.InputMapping, catalog), nil
-}
-
-func (r RuleTableResolver) Resolve(ctx context.Context, req ResolveRequest) (FactorValue, error) {
-	cfg, err := req.Factor.ruleTableConfig()
-	if err != nil {
-		return FactorValue{}, err
-	}
+func (f RuleTableFactor) Resolve(ctx context.Context, req ResolveRequest) (FactorValue, error) {
 	if req.RuleProvider == nil {
 		return NewFailedFactorValue(
 			req.Factor.Code,
 			req.Factor.DataType,
-			FactorSource{FactorType: req.Factor.Type, Scope: req.Factor.Scope, RuleTableCode: cfg.RuleTableCode},
+			FactorSource{FactorType: req.Factor.Type, Scope: req.Factor.Scope, RuleTableCode: f.config.RuleTableCode},
 			"RULE_PROVIDER_MISSING",
 			"rule table repository is not configured",
 		), nil
 	}
-	key, err := resolveMappedInputs(ctx, req.Catalog, req.Event, cfg.InputMapping, req.ResolveDependency)
+	key, err := resolveMappedInputs(ctx, req.Catalog, req.Event, f.config.InputMapping, req.ResolveDependency)
 	if err != nil {
 		return FactorValue{}, err
 	}
 	matched, err := req.RuleProvider.Match(ctx, RuleTableMatchRequest{
-		RuleTableCode: cfg.RuleTableCode,
+		RuleTableCode: f.config.RuleTableCode,
 		Inputs:        key,
 	})
 	if err != nil {
 		return NewFailedFactorValue(
 			req.Factor.Code,
 			req.Factor.DataType,
-			FactorSource{FactorType: req.Factor.Type, Scope: req.Factor.Scope, RuleTableCode: cfg.RuleTableCode, MatchedInputs: key},
+			FactorSource{FactorType: req.Factor.Type, Scope: req.Factor.Scope, RuleTableCode: f.config.RuleTableCode, MatchedInputs: key},
 			"RULE_TABLE_CONFLICT",
 			err.Error(),
 		), nil
@@ -309,7 +271,7 @@ func (r RuleTableResolver) Resolve(ctx context.Context, req ResolveRequest) (Fac
 	source := FactorSource{
 		FactorType:    req.Factor.Type,
 		Scope:         req.Factor.Scope,
-		RuleTableCode: cfg.RuleTableCode,
+		RuleTableCode: f.config.RuleTableCode,
 		MatchedInputs: key,
 		Version:       req.Factor.Version,
 	}
@@ -323,8 +285,8 @@ func (r RuleTableResolver) Resolve(ctx context.Context, req ResolveRequest) (Fac
 		), nil
 	}
 	raw := matched.OutputValue
-	if cfg.OutputPath != "" {
-		raw, _, err = getByPath(raw, cfg.OutputPath)
+	if f.config.OutputPath != "" {
+		raw, _, err = getByPath(raw, f.config.OutputPath)
 		if err != nil {
 			return FactorValue{}, err
 		}
@@ -339,43 +301,51 @@ func (r RuleTableResolver) Resolve(ctx context.Context, req ResolveRequest) (Fac
 	return buildFactorValue(req.Factor, raw, source)
 }
 
-type RateMatchResolver struct {
-	RuleTableResolver
+type RateMatchFactor struct {
+	RuleTableFactor
 }
 
-func (r RateMatchResolver) Type() FactorType { return FactorTypeRateMatch }
+type RateMatchFactorProvider struct{}
 
-type ConstantResolver struct{}
+func (p RateMatchFactorProvider) Type() FactorType { return FactorTypeRateMatch }
+func (p RateMatchFactorProvider) NewFactor(def FactorDefinition) (Factor, error) {
+	cfg, err := def.ruleTableConfig()
+	if err != nil {
+		return nil, fmt.Errorf("factor %s: decode rate match config: %w", def.Code, err)
+	}
+	if cfg == nil || cfg.RuleTableCode == "" || len(cfg.InputMapping) == 0 {
+		return nil, fmt.Errorf("factor %s: missing rate match config", def.Code)
+	}
+	return RateMatchFactor{RuleTableFactor: RuleTableFactor{definition: def, config: *cfg}}, nil
+}
 
-func (r ConstantResolver) Type() FactorType { return FactorTypeConstant }
+type ConstantFactor struct {
+	definition FactorDefinition
+	config     ConstantConfig
+}
 
-func (r ConstantResolver) Validate(def FactorDefinition, _ FactorCatalog) error {
+type ConstantFactorProvider struct{}
+
+func (p ConstantFactorProvider) Type() FactorType { return FactorTypeConstant }
+func (p ConstantFactorProvider) NewFactor(def FactorDefinition) (Factor, error) {
 	cfg, err := def.constantConfig()
 	if err != nil {
-		return fmt.Errorf("factor %s: decode constant config: %w", def.Code, err)
+		return nil, fmt.Errorf("factor %s: decode constant config: %w", def.Code, err)
 	}
 	if cfg == nil {
-		return fmt.Errorf("factor %s: missing constant config", def.Code)
+		return nil, fmt.Errorf("factor %s: missing constant config", def.Code)
 	}
-	return nil
+	return ConstantFactor{definition: def, config: *cfg}, nil
 }
 
-func (r ConstantResolver) Dependencies(_ FactorDefinition, _ FactorCatalog) ([]FactorCode, error) {
-	return nil, nil
-}
-
-func (r ConstantResolver) Resolve(_ context.Context, req ResolveRequest) (FactorValue, error) {
-	cfg, err := req.Factor.constantConfig()
-	if err != nil {
-		return FactorValue{}, err
-	}
+func (f ConstantFactor) Resolve(_ context.Context, req ResolveRequest) (FactorValue, error) {
 	source := FactorSource{
 		FactorType:    req.Factor.Type,
 		Scope:         req.Factor.Scope,
-		ConstantValue: cfg.Value,
+		ConstantValue: f.config.Value,
 		Version:       req.Factor.Version,
 	}
-	return buildFactorValue(req.Factor, cfg.Value, source)
+	return buildFactorValue(req.Factor, f.config.Value, source)
 }
 
 func mappingDependencies(mapping map[string]string, catalog FactorCatalog) []FactorCode {

@@ -6,104 +6,46 @@ import (
 )
 
 type Engine struct {
-	registry    *Registry
-	rpcProvider RPCProvider
-	table       TableProvider
-	ruleTable   RuleTableRepository
+	registry *Registry
+	builder  CalculationContextBuilder
+	executor *FactorExecutor
 }
 
 func NewEngine(definitions []FactorDefinition, rpcProvider RPCProvider, table TableProvider) (*Engine, error) {
-	registry, err := NewRegistry(
-		definitions,
-		EventFieldResolver{},
-		ExpressionResolver{},
-		RPCResolver{},
-		TableLookupResolver{},
-		RuleTableResolver{},
-		RateMatchResolver{},
-		ConstantResolver{},
-	)
+	registry, err := NewRegistry(definitions)
 	if err != nil {
 		return nil, err
 	}
 
 	return &Engine{
-		registry:    registry,
-		rpcProvider: rpcProvider,
-		table:       table,
-		ruleTable:   inferRuleTableRepository(table),
+		registry: registry,
+		builder:  NewCalculationContextBuilder(),
+		executor: NewFactorExecutor(registry, ExecutorDependencies{
+			RPCProvider:   rpcProvider,
+			TableProvider: table,
+			RuleProvider:  inferRuleTableRepository(table),
+		}),
 	}, nil
 }
 
 func (e *Engine) Resolve(ctx context.Context, event map[string]any, targetCodes []string) (TypedFactorContext, error) {
-	return e.ResolveWithContext(ctx, NewCalculationContext(event, ChargeObject{}), targetCodes)
+	return e.ResolveWithContext(ctx, e.builder.BuildOrder(event), targetCodes)
 }
 
 func (e *Engine) ResolveWithContext(ctx context.Context, calcCtx CalculationContext, targetCodes []string) (TypedFactorContext, error) {
 	result := TypedFactorContext{Factors: map[string]FactorValue{}}
-	values := NewInMemoryFactorValueStore()
-	visiting := map[FactorCode]bool{}
-
+	codes := make([]FactorCode, 0, len(targetCodes))
 	for _, code := range targetCodes {
-		if _, err := e.resolveOne(ctx, calcCtx, FactorCode(code), values, visiting); err != nil {
-			return TypedFactorContext{}, err
-		}
+		codes = append(codes, FactorCode(code))
 	}
-
-	for code, value := range values.All() {
+	values, err := e.executor.ResolveFactors(ctx, calcCtx, codes)
+	if err != nil {
+		return TypedFactorContext{}, err
+	}
+	for code, value := range values {
 		result.Factors[string(code)] = value
 	}
 	return result, nil
-}
-
-func (e *Engine) resolveOne(
-	ctx context.Context,
-	event NormalizedEvent,
-	code FactorCode,
-	values FactorValueStore,
-	visiting map[FactorCode]bool,
-) (FactorValue, error) {
-	if value, ok := values.Get(code); ok {
-		return value, nil
-	}
-
-	factor, ok := e.registry.Get(code)
-	if !ok {
-		return FactorValue{}, fmt.Errorf("factor %s not defined", code)
-	}
-	if visiting[code] {
-		return FactorValue{}, fmt.Errorf("factor dependency cycle detected at %s", code)
-	}
-
-	visiting[code] = true
-	defer delete(visiting, code)
-
-	def := factor.Definition()
-	value, err := factor.Resolve(ctx, ResolveRequest{
-		Factor:  def,
-		Catalog: e.registry.Catalog(),
-		Event:   event,
-		Values:  values,
-		ResolveDependency: func(ctx context.Context, dependency FactorCode) (FactorValue, error) {
-			return e.resolveOne(ctx, event, dependency, values, visiting)
-		},
-		RPCProvider:   e.rpcProvider,
-		TableProvider: e.table,
-		RuleProvider:  e.ruleTable,
-	})
-	if err != nil {
-		if def.DefaultValue != nil {
-			defaulted, defaultErr := buildDefaultedFactorValue(def)
-			if defaultErr == nil {
-				values.Set(code, defaulted)
-				return defaulted, nil
-			}
-		}
-		return FactorValue{}, err
-	}
-
-	values.Set(code, value)
-	return value, nil
 }
 
 func inferRuleTableRepository(table TableProvider) RuleTableRepository {
