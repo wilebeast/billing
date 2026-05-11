@@ -397,6 +397,7 @@ type InputBinding struct {
 
 type Factor interface {
 	Definition() FactorDefinition
+	Dependencies() []FactorCode
 	Resolve(ctx context.Context, req ResolveContext) (FactorValue, error)
 }
 

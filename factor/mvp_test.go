@@ -2,7 +2,9 @@ package factor
 
 import (
 	"context"
+	"fmt"
 	"math/big"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -245,7 +247,7 @@ func TestFactorExecutorResolvesDependencies(t *testing.T) {
 		t.Fatalf("NewRegistry: %v", err)
 	}
 
-	executor := NewFactorExecutor(registry, ExecutorDependencies{})
+	executor := NewFactorExecutor(registry, ExecutorDependencies{}, DefaultEngineOptions())
 	values, err := executor.ResolveFactors(context.Background(), NewCalculationContext(map[string]any{
 		"payment": map[string]any{"amount": 100.0},
 	}, ChargeObject{Scope: FactorScopeOrder}), []FactorCode{"service_fee_amount"})
@@ -259,6 +261,202 @@ func TestFactorExecutorResolvesDependencies(t *testing.T) {
 	}
 	if got.Cmp(big.NewRat(20, 1)) != 0 {
 		t.Fatalf("service_fee_amount = %s, want 20", got.FloatString(6))
+	}
+}
+
+func TestFactorExecutorTaskPoolRunsIndependentRPCFactorsConcurrently(t *testing.T) {
+	release := make(chan struct{})
+	entered := make(chan struct{}, 2)
+	var current int32
+	var maxConcurrent int32
+
+	handler := func(level string) RPCHandler {
+		return func(ctx context.Context, request RPCRequest) (RPCResponse, error) {
+			active := atomic.AddInt32(&current, 1)
+			defer atomic.AddInt32(&current, -1)
+			for {
+				maxSeen := atomic.LoadInt32(&maxConcurrent)
+				if active <= maxSeen {
+					break
+				}
+				if atomic.CompareAndSwapInt32(&maxConcurrent, maxSeen, active) {
+					break
+				}
+			}
+			entered <- struct{}{}
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return RPCResponse{}, ctx.Err()
+			}
+			return RPCResponse{Payload: map[string]any{
+				"data": map[string]any{"level": level},
+			}}, nil
+		}
+	}
+
+	rpcProvider := NewInMemoryRPCProvider()
+	rpcProvider.Register("GET_LEVEL_A", handler("A"))
+	rpcProvider.Register("GET_LEVEL_B", handler("B"))
+
+	engine, err := NewEngineWithOptions([]FactorDefinition{
+		{
+			Code:     "merchant_level_a",
+			Type:     FactorTypeRPC,
+			Scope:    FactorScopeOrder,
+			DataType: FactorDataTypeString,
+			RPC: &RPCConfig{
+				ProviderCode: "GET_LEVEL_A",
+				Method:       "MerchantService.GetLevelA",
+			},
+		},
+		{
+			Code:     "merchant_level_b",
+			Type:     FactorTypeRPC,
+			Scope:    FactorScopeOrder,
+			DataType: FactorDataTypeString,
+			RPC: &RPCConfig{
+				ProviderCode: "GET_LEVEL_B",
+				Method:       "MerchantService.GetLevelB",
+			},
+		},
+	}, rpcProvider, nil, EngineOptions{
+		FactorIOWorkers: 2,
+		RuleCPUWorkers:  1,
+	})
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, resolveErr := engine.Resolve(context.Background(), map[string]any{}, []string{"merchant_level_a", "merchant_level_b"})
+		done <- resolveErr
+	}()
+
+	for i := 0; i < 2; i++ {
+		select {
+		case <-entered:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for RPC tasks to start")
+		}
+	}
+	close(release)
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for resolve")
+	}
+
+	if got := atomic.LoadInt32(&maxConcurrent); got < 2 {
+		t.Fatalf("max concurrency = %d, want at least 2", got)
+	}
+}
+
+func TestFactorExecutorDAGSchedulerRespectsDependencies(t *testing.T) {
+	const testType FactorType = FactorTypeRPC
+
+	started := make(chan string, 3)
+	releaseA := make(chan struct{})
+	releaseB := make(chan struct{})
+
+	registry, err := NewRegistryWithFactory([]FactorDefinition{
+		{Code: "A", Type: testType, Scope: FactorScopeOrder, DataType: FactorDataTypeString},
+		{Code: "B", Type: testType, Scope: FactorScopeOrder, DataType: FactorDataTypeString},
+		{Code: "C", Type: testType, Scope: FactorScopeOrder, DataType: FactorDataTypeString},
+	}, NewFactorFactory(scriptedFactorProvider{
+		factorType: testType,
+		specs: map[FactorCode]scriptedFactorSpec{
+			"A": {value: "a", started: started, release: releaseA},
+			"B": {value: "b", started: started, release: releaseB},
+			"C": {value: "c", started: started, dependencies: []FactorCode{"A", "B"}},
+		},
+	}))
+	if err != nil {
+		t.Fatalf("NewRegistryWithFactory: %v", err)
+	}
+
+	executor := NewFactorExecutor(registry, ExecutorDependencies{}, DefaultEngineOptions())
+	done := make(chan error, 1)
+	go func() {
+		_, resolveErr := executor.ResolveFactors(context.Background(), NewCalculationContext(map[string]any{}, ChargeObject{Scope: FactorScopeOrder}), []FactorCode{"C"})
+		done <- resolveErr
+	}()
+
+	seen := map[string]bool{}
+	for len(seen) < 2 {
+		select {
+		case code := <-started:
+			seen[code] = true
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for root DAG nodes to start")
+		}
+	}
+	if !seen["A"] || !seen["B"] {
+		t.Fatalf("expected A and B to start first, got %+v", seen)
+	}
+
+	select {
+	case code := <-started:
+		t.Fatalf("unexpected dependent node start before deps complete: %s", code)
+	default:
+	}
+
+	close(releaseA)
+	select {
+	case code := <-started:
+		t.Fatalf("dependent started before all deps completed: %s", code)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(releaseB)
+	select {
+	case code := <-started:
+		if code != "C" {
+			t.Fatalf("expected dependent C to start, got %s", code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for dependent node to start")
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for DAG resolve")
+	}
+}
+
+func TestFactorExecutorDAGSchedulerDetectsCycle(t *testing.T) {
+	const testType FactorType = FactorTypeRPC
+
+	registry, err := NewRegistryWithFactory([]FactorDefinition{
+		{Code: "A", Type: testType, Scope: FactorScopeOrder, DataType: FactorDataTypeString},
+		{Code: "B", Type: testType, Scope: FactorScopeOrder, DataType: FactorDataTypeString},
+	}, NewFactorFactory(scriptedFactorProvider{
+		factorType: testType,
+		specs: map[FactorCode]scriptedFactorSpec{
+			"A": {value: "a", dependencies: []FactorCode{"B"}},
+			"B": {value: "b", dependencies: []FactorCode{"A"}},
+		},
+	}))
+	if err != nil {
+		t.Fatalf("NewRegistryWithFactory: %v", err)
+	}
+
+	executor := NewFactorExecutor(registry, ExecutorDependencies{}, DefaultEngineOptions())
+	_, err = executor.ResolveFactors(context.Background(), NewCalculationContext(map[string]any{}, ChargeObject{Scope: FactorScopeOrder}), []FactorCode{"A"})
+	if err == nil {
+		t.Fatal("expected cycle detection error")
+	}
+	if got := err.Error(); got != "factor dependency cycle detected at A" && got != "factor dependency cycle detected at B" {
+		t.Fatalf("unexpected cycle error: %v", err)
 	}
 }
 
@@ -434,6 +632,57 @@ func TestRateMatchConflictReturnsFailedFactor(t *testing.T) {
 	if got := ctx.Factors["rate"].ErrorCode; got != "RULE_TABLE_CONFLICT" {
 		t.Fatalf("rate error code = %s", got)
 	}
+}
+
+type scriptedFactorSpec struct {
+	value        any
+	dependencies []FactorCode
+	started      chan<- string
+	release      <-chan struct{}
+}
+
+type scriptedFactorProvider struct {
+	factorType FactorType
+	specs      map[FactorCode]scriptedFactorSpec
+}
+
+func (p scriptedFactorProvider) Type() FactorType { return p.factorType }
+
+func (p scriptedFactorProvider) NewFactor(def FactorDefinition, _ FactorCatalog) (Factor, error) {
+	spec, ok := p.specs[def.Code]
+	if !ok {
+		return nil, fmt.Errorf("missing scripted factor spec for %s", def.Code)
+	}
+	return scriptedFactor{definition: def, spec: spec}, nil
+}
+
+type scriptedFactor struct {
+	definition FactorDefinition
+	spec       scriptedFactorSpec
+}
+
+func (f scriptedFactor) Definition() FactorDefinition { return f.definition }
+
+func (f scriptedFactor) Dependencies() []FactorCode {
+	return append([]FactorCode(nil), f.spec.dependencies...)
+}
+
+func (f scriptedFactor) Resolve(ctx context.Context, _ ResolveContext) (FactorValue, error) {
+	if f.spec.started != nil {
+		f.spec.started <- string(f.definition.Code)
+	}
+	if f.spec.release != nil {
+		select {
+		case <-f.spec.release:
+		case <-ctx.Done():
+			return FactorValue{}, ctx.Err()
+		}
+	}
+	source := FactorSource{
+		FactorType: f.definition.Type,
+		Scope:      f.definition.Scope,
+	}
+	return buildFactorValue(f.definition, f.spec.value, source)
 }
 
 func makeRPCProvider() *InMemoryRPCProvider {

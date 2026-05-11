@@ -3,6 +3,8 @@ package factor
 import (
 	"context"
 	"fmt"
+	"runtime"
+	"sync"
 )
 
 type Engine struct {
@@ -11,7 +13,27 @@ type Engine struct {
 	executor *FactorExecutor
 }
 
+type EngineOptions struct {
+	FactorIOWorkers int
+	RuleCPUWorkers  int
+}
+
+func DefaultEngineOptions() EngineOptions {
+	cpuWorkers := runtime.GOMAXPROCS(0)
+	if cpuWorkers < 2 {
+		cpuWorkers = 2
+	}
+	return EngineOptions{
+		FactorIOWorkers: 16,
+		RuleCPUWorkers:  cpuWorkers,
+	}
+}
+
 func NewEngine(definitions []FactorDefinition, rpcProvider RPCProvider, table TableProvider) (*Engine, error) {
+	return NewEngineWithOptions(definitions, rpcProvider, table, DefaultEngineOptions())
+}
+
+func NewEngineWithOptions(definitions []FactorDefinition, rpcProvider RPCProvider, table TableProvider, opts EngineOptions) (*Engine, error) {
 	registry, err := NewRegistry(definitions)
 	if err != nil {
 		return nil, err
@@ -24,7 +46,7 @@ func NewEngine(definitions []FactorDefinition, rpcProvider RPCProvider, table Ta
 			RPCProvider:   rpcProvider,
 			TableProvider: table,
 			RuleProvider:  inferRuleTableRepository(table),
-		}),
+		}, opts),
 	}, nil
 }
 
@@ -66,12 +88,20 @@ func resolveMappedInputs(
 	resolveDependency func(ctx context.Context, code FactorCode) (FactorValue, error),
 ) (map[string]any, error) {
 	input := make(map[string]any, len(bindings))
+	dependencies := make([]FactorCode, 0, len(bindings))
+	for _, binding := range bindings {
+		if resolveDependency != nil && binding.Dependency != "" {
+			dependencies = append(dependencies, binding.Dependency)
+		}
+	}
+	resolved, err := resolveDependencyValues(ctx, dependencies, resolveDependency)
+	if err != nil {
+		return nil, err
+	}
+
 	for target, binding := range bindings {
 		if resolveDependency != nil && binding.Dependency != "" {
-			value, err := resolveDependency(ctx, binding.Dependency)
-			if err != nil {
-				return nil, err
-			}
+			value := resolved[binding.Dependency]
 			if !isScalarStatusOK(value) {
 				return nil, fmt.Errorf("mapped input %s=%s is not usable: %s", target, binding.Dependency, value.Status)
 			}
@@ -105,6 +135,17 @@ func resolveMappedFactorInputs(
 	resolveDependency func(ctx context.Context, code FactorCode) (FactorValue, error),
 ) (map[string]FactorValue, error) {
 	input := make(map[string]FactorValue, len(bindings))
+	dependencies := make([]FactorCode, 0, len(bindings))
+	for _, binding := range bindings {
+		if resolveDependency != nil && binding.Dependency != "" {
+			dependencies = append(dependencies, binding.Dependency)
+		}
+	}
+	resolved, err := resolveDependencyValues(ctx, dependencies, resolveDependency)
+	if err != nil {
+		return nil, err
+	}
+
 	for target, binding := range bindings {
 		if resolveDependency == nil || binding.Dependency == "" {
 			raw, ok, err := event.GetByPath(binding.SourcePath)
@@ -125,10 +166,7 @@ func resolveMappedFactorInputs(
 			continue
 		}
 
-		value, err := resolveDependency(ctx, binding.Dependency)
-		if err != nil {
-			return nil, err
-		}
+		value := resolved[binding.Dependency]
 		if !isScalarStatusOK(value) {
 			return nil, fmt.Errorf("mapped input %s=%s is not usable: %s", target, binding.Dependency, value.Status)
 		}
@@ -171,4 +209,50 @@ func buildDefaultedFactorValue(def FactorDefinition) (FactorValue, error) {
 		return FactorValue{}, fmt.Errorf("factor %s default normalize: %w", def.Code, err)
 	}
 	return NewDefaultedFactorValue(def.Code, def.Type, def.DataType, normalized, *def.DefaultValue, source), nil
+}
+
+func resolveDependencyValues(
+	ctx context.Context,
+	deps []FactorCode,
+	resolve func(context.Context, FactorCode) (FactorValue, error),
+) (map[FactorCode]FactorValue, error) {
+	results := make(map[FactorCode]FactorValue, len(deps))
+	if len(deps) == 0 {
+		return results, nil
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var (
+		mu       sync.Mutex
+		wg       sync.WaitGroup
+		firstErr error
+		once     sync.Once
+	)
+
+	for _, dep := range deps {
+		dep := dep
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			value, err := resolve(ctx, dep)
+			if err != nil {
+				once.Do(func() {
+					firstErr = err
+					cancel()
+				})
+				return
+			}
+			mu.Lock()
+			results[dep] = value
+			mu.Unlock()
+		}()
+	}
+
+	wg.Wait()
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	return results, nil
 }

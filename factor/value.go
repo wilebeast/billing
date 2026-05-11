@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math/big"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -374,6 +375,7 @@ type FactorValueStore interface {
 }
 
 type InMemoryFactorValueStore struct {
+	mu     sync.RWMutex
 	values map[FactorInstanceKey]FactorValue
 }
 
@@ -382,15 +384,21 @@ func NewInMemoryFactorValueStore() *InMemoryFactorValueStore {
 }
 
 func (s *InMemoryFactorValueStore) Get(key FactorInstanceKey) (FactorValue, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	v, ok := s.values[key]
 	return v, ok
 }
 
 func (s *InMemoryFactorValueStore) Set(key FactorInstanceKey, value FactorValue) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.values[key] = value
 }
 
 func (s *InMemoryFactorValueStore) All() map[FactorInstanceKey]FactorValue {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	out := make(map[FactorInstanceKey]FactorValue, len(s.values))
 	for k, v := range s.values {
 		out[k] = v

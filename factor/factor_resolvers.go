@@ -26,6 +26,7 @@ type EventFieldFactor struct {
 }
 
 func (f EventFieldFactor) Definition() FactorDefinition { return f.definition }
+func (f EventFieldFactor) Dependencies() []FactorCode   { return nil }
 
 func (f EventFieldFactor) Resolve(_ context.Context, req ResolveContext) (FactorValue, error) {
 	source := FactorSource{
@@ -98,14 +99,18 @@ func expressionDependencies(cfg ExpressionConfig) ([]FactorCode, error) {
 }
 
 func (f ExpressionFactor) Definition() FactorDefinition { return f.definition }
+func (f ExpressionFactor) Dependencies() []FactorCode {
+	return append([]FactorCode(nil), f.dependencies...)
+}
 
 func (f ExpressionFactor) Resolve(ctx context.Context, req ResolveContext) (FactorValue, error) {
 	params := map[string]any{}
+	values, err := resolveDependencyValues(ctx, f.dependencies, req.ResolveDependency)
+	if err != nil {
+		return FactorValue{}, err
+	}
 	for _, dep := range f.dependencies {
-		value, err := req.ResolveDependency(ctx, FactorCode(dep))
-		if err != nil {
-			return FactorValue{}, err
-		}
+		value := values[dep]
 		if !isScalarStatusOK(value) {
 			return FactorValue{}, fmt.Errorf("expression factor %s depends on unusable factor %s status=%s", f.definition.Code, dep, value.Status)
 		}
@@ -154,6 +159,9 @@ func (p RPCFactorProvider) NewFactor(def FactorDefinition, catalog FactorCatalog
 }
 
 func (f RPCFactor) Definition() FactorDefinition { return f.definition }
+func (f RPCFactor) Dependencies() []FactorCode {
+	return bindingDependencies(f.inputBindings)
+}
 
 func (f RPCFactor) Resolve(ctx context.Context, req ResolveContext) (FactorValue, error) {
 	inputs, err := resolveMappedFactorInputs(ctx, req.Event, f.inputBindings, req.ResolveDependency)
@@ -213,6 +221,9 @@ func (p TableLookupFactorProvider) NewFactor(def FactorDefinition, catalog Facto
 }
 
 func (f TableLookupFactor) Definition() FactorDefinition { return f.definition }
+func (f TableLookupFactor) Dependencies() []FactorCode {
+	return bindingDependencies(f.inputBindings)
+}
 
 func (f TableLookupFactor) Resolve(ctx context.Context, req ResolveContext) (FactorValue, error) {
 	key, err := resolveMappedInputs(ctx, req.Event, f.inputBindings, req.ResolveDependency)
@@ -265,6 +276,9 @@ func (p RuleTableFactorProvider) NewFactor(def FactorDefinition, catalog FactorC
 }
 
 func (f RuleTableFactor) Definition() FactorDefinition { return f.definition }
+func (f RuleTableFactor) Dependencies() []FactorCode {
+	return bindingDependencies(f.inputBindings)
+}
 
 func (f RuleTableFactor) Resolve(ctx context.Context, req ResolveContext) (FactorValue, error) {
 	if req.RuleProvider == nil {
@@ -368,6 +382,7 @@ func (p ConstantFactorProvider) NewFactor(def FactorDefinition, _ FactorCatalog)
 }
 
 func (f ConstantFactor) Definition() FactorDefinition { return f.definition }
+func (f ConstantFactor) Dependencies() []FactorCode   { return nil }
 
 func (f ConstantFactor) Resolve(_ context.Context, _ ResolveContext) (FactorValue, error) {
 	source := FactorSource{
@@ -389,6 +404,22 @@ func compileInputBindings(mapping map[string]string, catalog FactorCatalog) map[
 		bindings[target] = binding
 	}
 	return bindings
+}
+
+func bindingDependencies(bindings map[string]InputBinding) []FactorCode {
+	seen := make(map[FactorCode]struct{}, len(bindings))
+	deps := make([]FactorCode, 0, len(bindings))
+	for _, binding := range bindings {
+		if binding.Dependency == "" {
+			continue
+		}
+		if _, ok := seen[binding.Dependency]; ok {
+			continue
+		}
+		seen[binding.Dependency] = struct{}{}
+		deps = append(deps, binding.Dependency)
+	}
+	return deps
 }
 
 func getScopedValue(event NormalizedEvent, scope FactorScope, path string) (any, bool, error) {
