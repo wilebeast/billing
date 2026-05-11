@@ -29,7 +29,7 @@ func (e *FactorExecutor) ResolveFactors(
 	targetCodes []FactorCode,
 ) (map[FactorCode]FactorValue, error) {
 	values := NewInMemoryFactorValueStore()
-	visiting := map[FactorCode]bool{}
+	visiting := map[FactorInstanceKey]bool{}
 
 	for _, code := range targetCodes {
 		if _, err := e.resolveOne(ctx, calcCtx, code, values, visiting); err != nil {
@@ -37,42 +37,41 @@ func (e *FactorExecutor) ResolveFactors(
 		}
 	}
 
-	return values.All(), nil
+	allValues := values.All()
+	result := make(map[FactorCode]FactorValue, len(allValues))
+	for _, value := range allValues {
+		result[value.Code] = value
+	}
+	return result, nil
 }
 
 func (e *FactorExecutor) resolveOne(
 	ctx context.Context,
-	event NormalizedEvent,
+	calcCtx CalculationContext,
 	code FactorCode,
 	values FactorValueStore,
-	visiting map[FactorCode]bool,
+	visiting map[FactorInstanceKey]bool,
 ) (FactorValue, error) {
-	if value, ok := values.Get(code); ok {
-		return value, nil
-	}
-
 	factor, ok := e.registry.Get(code)
 	if !ok {
 		return FactorValue{}, fmt.Errorf("factor %s not defined", code)
 	}
-	def, ok := e.registry.Definition(code)
-	if !ok {
-		return FactorValue{}, fmt.Errorf("factor definition %s not found", code)
+	def := factor.Definition()
+	key := calcCtx.FactorInstanceKey(def)
+	if value, ok := values.Get(key); ok {
+		return value, nil
 	}
-	if visiting[code] {
+	if visiting[key] {
 		return FactorValue{}, fmt.Errorf("factor dependency cycle detected at %s", code)
 	}
 
-	visiting[code] = true
-	defer delete(visiting, code)
+	visiting[key] = true
+	defer delete(visiting, key)
 
-	value, err := factor.Resolve(ctx, ResolveRequest{
-		Factor:  def,
-		Catalog: e.registry.Catalog(),
-		Event:   event,
-		Values:  values,
+	value, err := factor.Resolve(ctx, ResolveContext{
+		Event: calcCtx,
 		ResolveDependency: func(ctx context.Context, dependency FactorCode) (FactorValue, error) {
-			return e.resolveOne(ctx, event, dependency, values, visiting)
+			return e.resolveOne(ctx, calcCtx, dependency, values, visiting)
 		},
 		RPCProvider:   e.deps.RPCProvider,
 		TableProvider: e.deps.TableProvider,
@@ -82,13 +81,13 @@ func (e *FactorExecutor) resolveOne(
 		if def.DefaultValue != nil {
 			defaulted, defaultErr := buildDefaultedFactorValue(def)
 			if defaultErr == nil {
-				values.Set(code, defaulted)
+				values.Set(key, defaulted)
 				return defaulted, nil
 			}
 		}
 		return FactorValue{}, err
 	}
 
-	values.Set(code, value)
+	values.Set(key, value)
 	return value, nil
 }

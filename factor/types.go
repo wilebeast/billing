@@ -324,6 +324,12 @@ type CalculationContext struct {
 	ChargeObject ChargeObject
 }
 
+type FactorInstanceKey struct {
+	Code           FactorCode
+	Scope          FactorScope
+	ChargeObjectID string
+}
+
 func NewCalculationContext(event map[string]any, object ChargeObject) CalculationContext {
 	return CalculationContext{
 		Event:        NewMapEvent(event),
@@ -353,6 +359,17 @@ func (c CalculationContext) GetByScope(scope FactorScope, path string) (any, boo
 	}
 }
 
+func (c CalculationContext) FactorInstanceKey(def FactorDefinition) FactorInstanceKey {
+	key := FactorInstanceKey{
+		Code:  def.Code,
+		Scope: def.Scope,
+	}
+	if def.Scope == FactorScopeItem {
+		key.ChargeObjectID = c.ChargeObject.ID
+	}
+	return key
+}
+
 type FactorCatalog map[FactorCode]FactorDefinition
 
 func (c FactorCatalog) Get(code FactorCode) (FactorDefinition, bool) {
@@ -365,24 +382,25 @@ func (c FactorCatalog) Has(code string) bool {
 	return ok
 }
 
-type ResolveRequest struct {
+type ResolveContext struct {
 	Event             NormalizedEvent
-	Factor            FactorDefinition
-	Catalog           FactorCatalog
-	Values            FactorValueStore
-	RuleCtx           RuleContext
-	CalcMeta          CalculationMeta
 	ResolveDependency func(ctx context.Context, code FactorCode) (FactorValue, error)
 	RPCProvider       RPCProvider
 	TableProvider     TableProvider
 	RuleProvider      RuleTableRepository
 }
 
+type InputBinding struct {
+	SourcePath string
+	Dependency FactorCode
+}
+
 type Factor interface {
-	Resolve(ctx context.Context, req ResolveRequest) (FactorValue, error)
+	Definition() FactorDefinition
+	Resolve(ctx context.Context, req ResolveContext) (FactorValue, error)
 }
 
 type FactorProvider interface {
 	Type() FactorType
-	NewFactor(def FactorDefinition) (Factor, error)
+	NewFactor(def FactorDefinition, catalog FactorCatalog) (Factor, error)
 }

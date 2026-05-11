@@ -61,23 +61,22 @@ func inferRuleTableRepository(table TableProvider) RuleTableRepository {
 
 func resolveMappedInputs(
 	ctx context.Context,
-	catalog FactorCatalog,
 	event NormalizedEvent,
-	mapping map[string]string,
+	bindings map[string]InputBinding,
 	resolveDependency func(ctx context.Context, code FactorCode) (FactorValue, error),
 ) (map[string]any, error) {
-	input := make(map[string]any, len(mapping))
-	for target, source := range mapping {
-		if resolveDependency != nil && catalog.Has(source) {
-			value, err := resolveDependency(ctx, FactorCode(source))
+	input := make(map[string]any, len(bindings))
+	for target, binding := range bindings {
+		if resolveDependency != nil && binding.Dependency != "" {
+			value, err := resolveDependency(ctx, binding.Dependency)
 			if err != nil {
 				return nil, err
 			}
 			if !isScalarStatusOK(value) {
-				return nil, fmt.Errorf("mapped input %s=%s is not usable: %s", target, source, value.Status)
+				return nil, fmt.Errorf("mapped input %s=%s is not usable: %s", target, binding.Dependency, value.Status)
 			}
 			if value.DataType == FactorDataTypeObject || value.DataType == FactorDataTypeArray {
-				return nil, fmt.Errorf("mapped input %s=%s must be scalar", target, source)
+				return nil, fmt.Errorf("mapped input %s=%s must be scalar", target, binding.Dependency)
 			}
 			param, err := value.ToExpressionParam()
 			if err != nil {
@@ -87,12 +86,12 @@ func resolveMappedInputs(
 			continue
 		}
 
-		raw, ok, err := event.GetByPath(source)
+		raw, ok, err := event.GetByPath(binding.SourcePath)
 		if err != nil {
 			return nil, err
 		}
 		if !ok {
-			return nil, fmt.Errorf("mapped input %s source %s missing", target, source)
+			return nil, fmt.Errorf("mapped input %s source %s missing", target, binding.SourcePath)
 		}
 		input[target] = raw
 	}
@@ -101,23 +100,22 @@ func resolveMappedInputs(
 
 func resolveMappedFactorInputs(
 	ctx context.Context,
-	catalog FactorCatalog,
 	event NormalizedEvent,
-	mapping map[string]string,
+	bindings map[string]InputBinding,
 	resolveDependency func(ctx context.Context, code FactorCode) (FactorValue, error),
 ) (map[string]FactorValue, error) {
-	input := make(map[string]FactorValue, len(mapping))
-	for target, source := range mapping {
-		if resolveDependency == nil || !catalog.Has(source) {
-			raw, ok, err := event.GetByPath(source)
+	input := make(map[string]FactorValue, len(bindings))
+	for target, binding := range bindings {
+		if resolveDependency == nil || binding.Dependency == "" {
+			raw, ok, err := event.GetByPath(binding.SourcePath)
 			if err != nil {
 				return nil, err
 			}
 			if !ok {
-				return nil, fmt.Errorf("mapped input %s source %s missing", target, source)
+				return nil, fmt.Errorf("mapped input %s source %s missing", target, binding.SourcePath)
 			}
 			input[target] = FactorValue{
-				Code:       FactorCode(source),
+				Code:       FactorCode(binding.SourcePath),
 				FactorType: FactorTypeEventField,
 				Status:     FactorStatusOK,
 				Value:      raw,
@@ -127,15 +125,15 @@ func resolveMappedFactorInputs(
 			continue
 		}
 
-		value, err := resolveDependency(ctx, FactorCode(source))
+		value, err := resolveDependency(ctx, binding.Dependency)
 		if err != nil {
 			return nil, err
 		}
 		if !isScalarStatusOK(value) {
-			return nil, fmt.Errorf("mapped input %s=%s is not usable: %s", target, source, value.Status)
+			return nil, fmt.Errorf("mapped input %s=%s is not usable: %s", target, binding.Dependency, value.Status)
 		}
 		if value.DataType == FactorDataTypeObject || value.DataType == FactorDataTypeArray {
-			return nil, fmt.Errorf("mapped input %s=%s must be scalar", target, source)
+			return nil, fmt.Errorf("mapped input %s=%s must be scalar", target, binding.Dependency)
 		}
 		input[target] = value
 	}

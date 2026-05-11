@@ -21,12 +21,12 @@ func (f *FactorFactory) Register(provider FactorProvider) {
 	f.providers[provider.Type()] = provider
 }
 
-func (f *FactorFactory) Create(def FactorDefinition) (Factor, error) {
+func (f *FactorFactory) Create(def FactorDefinition, catalog FactorCatalog) (Factor, error) {
 	provider, ok := f.providers[def.Type]
 	if !ok {
 		return nil, fmt.Errorf("factor %s: provider not found for type %s", def.Code, def.Type)
 	}
-	return provider.NewFactor(def)
+	return provider.NewFactor(def, catalog)
 }
 
 type Registry struct {
@@ -58,7 +58,7 @@ func NewRegistryWithFactory(definitions []FactorDefinition, factory *FactorFacto
 
 	factors := make(map[FactorCode]Factor, len(definitions))
 	for _, def := range definitions {
-		factor, err := factory.Create(def)
+		factor, err := factory.Create(def, catalog)
 		if err != nil {
 			return nil, err
 		}

@@ -368,30 +368,30 @@ func normalizeTime(raw any) (time.Time, error) {
 }
 
 type FactorValueStore interface {
-	Get(code FactorCode) (FactorValue, bool)
-	Set(code FactorCode, value FactorValue)
-	All() map[FactorCode]FactorValue
+	Get(key FactorInstanceKey) (FactorValue, bool)
+	Set(key FactorInstanceKey, value FactorValue)
+	All() map[FactorInstanceKey]FactorValue
 }
 
 type InMemoryFactorValueStore struct {
-	values map[FactorCode]FactorValue
+	values map[FactorInstanceKey]FactorValue
 }
 
 func NewInMemoryFactorValueStore() *InMemoryFactorValueStore {
-	return &InMemoryFactorValueStore{values: map[FactorCode]FactorValue{}}
+	return &InMemoryFactorValueStore{values: map[FactorInstanceKey]FactorValue{}}
 }
 
-func (s *InMemoryFactorValueStore) Get(code FactorCode) (FactorValue, bool) {
-	v, ok := s.values[code]
+func (s *InMemoryFactorValueStore) Get(key FactorInstanceKey) (FactorValue, bool) {
+	v, ok := s.values[key]
 	return v, ok
 }
 
-func (s *InMemoryFactorValueStore) Set(code FactorCode, value FactorValue) {
-	s.values[code] = value
+func (s *InMemoryFactorValueStore) Set(key FactorInstanceKey, value FactorValue) {
+	s.values[key] = value
 }
 
-func (s *InMemoryFactorValueStore) All() map[FactorCode]FactorValue {
-	out := make(map[FactorCode]FactorValue, len(s.values))
+func (s *InMemoryFactorValueStore) All() map[FactorInstanceKey]FactorValue {
+	out := make(map[FactorInstanceKey]FactorValue, len(s.values))
 	for k, v := range s.values {
 		out[k] = v
 	}
